@@ -40,18 +40,16 @@ class KalshiTradesIndexer(Indexer):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-        # Load existing trade IDs for deduplication
-        existing_trade_ids: set[str] = set()
+        # Load existing tickers to skip already processed markets
         existing_tickers: set[str] = set()
         parquet_files = list(DATA_DIR.glob("trades_*.parquet"))
         if parquet_files:
-            print("Loading existing trades for deduplication...")
+            print("Loading existing tickers to skip already processed markets...")
             try:
-                result = duckdb.sql(f"SELECT DISTINCT trade_id, ticker FROM '{DATA_DIR}/trades_*.parquet'").fetchall()
-                for trade_id, ticker in result:
-                    existing_trade_ids.add(trade_id)
+                result = duckdb.sql(f"SELECT DISTINCT ticker FROM '{DATA_DIR}/trades_*.parquet'").fetchall()
+                for (ticker,) in result:
                     existing_tickers.add(ticker)
-                print(f"Found {len(existing_trade_ids)} existing trades")
+                print(f"Found {len(existing_tickers)} existing markets already processed")
             except Exception:
                 pass
 
@@ -115,7 +113,7 @@ class KalshiTradesIndexer(Indexer):
                     return []
                 fetched_at = datetime.utcnow()
                 return [
-                    {**asdict(t), "_fetched_at": fetched_at} for t in trades if t.trade_id not in existing_trade_ids
+                    {**asdict(t), "_fetched_at": fetched_at} for t in trades
                 ]
             finally:
                 client.close()
