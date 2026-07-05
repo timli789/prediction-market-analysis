@@ -1,0 +1,11 @@
+# AI Coding Rules for prediction-market-analysis
+
+## Remote Database Execution Rules
+- **CRITICAL**: **NEVER** run local DuckDB queries, run python database analysis scripts, or read/scan Parquet files directly on the current Mac (`Tims-MacBook-Pro`) for the Kalshi or Polymarket datasets.
+- **ALWAYS** use the MCP tool `execute_sql` (running on the remote server `OldMacDuckDB`) to query and analyze prediction market data.
+- The available remote tables are:
+  - `kalshi_markets`
+  - `kalshi_trades`
+  - `polymarket_markets`
+  - `polymarket_trades`
+- All database querying, aggregation, and filtering must be performed on the remote 2013 MacBook Pro (`Tims-MacBook-Pro-2.local`) via the remote MCP tool, to prevent out-of-memory (OOM) errors and disk/CPU exhaustion on the current Mac.
