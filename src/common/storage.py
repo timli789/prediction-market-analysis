@@ -36,8 +36,20 @@ class ParquetStorage:
         return self._existing_tickers
 
     def append_markets(self, markets: list) -> int:
+        if not markets:
+            return 0
+
         fetched_at = datetime.utcnow()
-        existing = self._load_existing_tickers()
+        new_tickers = [m.ticker for m in markets]
+
+        # Query DuckDB to find which tickers in this batch already exist on disk
+        existing = set()
+        chunks = self._get_market_chunks()
+        if chunks:
+            tickers_str = ", ".join(f"'{t}'" for t in new_tickers)
+            query = f"SELECT DISTINCT ticker FROM '{self.data_dir}/markets_*.parquet' WHERE ticker IN ({tickers_str})"
+            result = duckdb.sql(query).fetchall()
+            existing = {row[0] for row in result}
 
         # Filter out duplicates
         records = []
@@ -49,7 +61,7 @@ class ParquetStorage:
                 existing.add(market.ticker)
 
         if not records:
-            return len(existing)
+            return 0
 
         new_df = pd.DataFrame(records)
         chunks = self._get_market_chunks()
@@ -57,7 +69,7 @@ class ParquetStorage:
         if not chunks:
             chunk_path = self._chunk_path(0, self.CHUNK_SIZE)
             new_df.to_parquet(chunk_path)
-            return len(existing)
+            return len(records)
 
         last_chunk = chunks[-1]
         last_df = pd.read_parquet(last_chunk)
@@ -74,4 +86,4 @@ class ParquetStorage:
             new_chunk_path = self._chunk_path(new_start, new_start + self.CHUNK_SIZE)
             remaining.to_parquet(new_chunk_path)
 
-        return len(existing)
+        return len(records)
