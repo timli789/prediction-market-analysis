@@ -45,7 +45,7 @@ class KalshiMarketsIndexer(Indexer):
             cursor=cursor,
             min_close_ts=self._min_close_ts,
             max_close_ts=self._max_close_ts,
-            status="finalized",
+            status="settled",
         ):
             if markets:
                 total_stored = storage.append_markets(markets)
