@@ -8,7 +8,7 @@ import pandas as pd
 
 
 class ParquetStorage:
-    CHUNK_SIZE = 10000
+    CHUNK_SIZE = 1000000
 
     def __init__(self, data_dir: Union[Path, str] = "data"):
         self.data_dir = Path(data_dir)
