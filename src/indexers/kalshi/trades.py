@@ -40,33 +40,51 @@ class KalshiTradesIndexer(Indexer):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-        # Load existing trade IDs for deduplication
-        existing_trade_ids: set[str] = set()
-        existing_tickers: set[str] = set()
+        # Apply resource limits so DuckDB spills to disk instead of getting OOM-killed
+        # on memory-constrained devices (e.g. Raspberry Pi).
+        duckdb.sql("PRAGMA max_memory='3GB'")
+        duckdb.sql("PRAGMA threads=2")
+        duckdb.sql(f"PRAGMA temp_directory='{DATA_DIR.parent / '.duckdb_tmp'}'")
+
+        # Compute markets not yet processed via a DuckDB set difference instead of
+        # materializing every existing trade_id into Python sets (was OOM-killing
+        # this on memory-constrained devices once enough parquet files piled up).
+        # Skipping is done at the ticker level: a ticker is only re-fetched if it
+        # has no trades file at all yet, so partially-fetched tickers aren't
+        # deduped trade-by-trade — this trades fine-grained resumability for
+        # bounded memory use, which is fine since fetches are per-ticker anyway.
         parquet_files = list(DATA_DIR.glob("trades_*.parquet"))
+
+        total_markets = duckdb.sql(f"""
+            SELECT COUNT(DISTINCT ticker) FROM '{MARKETS_DIR}/markets_*_*.parquet'
+            WHERE volume >= 100 AND status = 'finalized'
+        """).fetchone()[0]
+        print(f"Found {total_markets} unique markets")
+
         if parquet_files:
-            print("Loading existing trades for deduplication...")
-            try:
-                result = duckdb.sql(f"SELECT DISTINCT trade_id, ticker FROM '{DATA_DIR}/trades_*.parquet'").fetchall()
-                for trade_id, ticker in result:
-                    existing_trade_ids.add(trade_id)
-                    existing_tickers.add(ticker)
-                print(f"Found {len(existing_trade_ids)} existing trades")
-            except Exception:
-                pass
+            print("Computing markets not yet processed...")
+            tickers_to_process = [
+                row[0]
+                for row in duckdb.sql(f"""
+                    SELECT DISTINCT ticker FROM '{MARKETS_DIR}/markets_*_*.parquet'
+                    WHERE volume >= 100 AND status = 'finalized'
+                    EXCEPT
+                    SELECT DISTINCT ticker FROM '{DATA_DIR}/trades_*.parquet'
+                    ORDER BY ticker
+                """).fetchall()
+            ]
+        else:
+            tickers_to_process = [
+                row[0]
+                for row in duckdb.sql(f"""
+                    SELECT DISTINCT ticker FROM '{MARKETS_DIR}/markets_*_*.parquet'
+                    WHERE volume >= 100 AND status = 'finalized'
+                    ORDER BY ticker
+                """).fetchall()
+            ]
 
-        all_tickers = duckdb.sql(f"""
-            SELECT DISTINCT ticker FROM '{MARKETS_DIR}/markets_*_*.parquet'
-            WHERE volume >= 100
-            ORDER BY ticker
-        """).fetchall()
-        all_tickers = [row[0] for row in all_tickers]
-        print(f"Found {len(all_tickers)} unique markets")
-
-        # Filter to tickers not fully processed
-        tickers_to_process = [t for t in all_tickers if t not in existing_tickers]
         print(
-            f"Skipped {len(all_tickers) - len(tickers_to_process)} already processed, "
+            f"Skipped {total_markets - len(tickers_to_process)} already processed, "
             f"{len(tickers_to_process)} to fetch"
         )
 
@@ -114,36 +132,39 @@ class KalshiTradesIndexer(Indexer):
                 if not trades:
                     return []
                 fetched_at = datetime.utcnow()
-                return [
-                    {**asdict(t), "_fetched_at": fetched_at} for t in trades if t.trade_id not in existing_trade_ids
-                ]
+                return [{**asdict(t), "_fetched_at": fetched_at} for t in trades]
             finally:
                 client.close()
 
-        # Concurrent fetching
+        # Concurrent fetching, submitted in bounded chunks so we never hold
+        # millions of pending Future objects in memory at once (was the other
+        # major contributor to the OOM kill).
+        SUBMIT_CHUNK_SIZE = 2000
         pbar = tqdm(total=len(tickers_to_process), desc="Fetching trades")
         with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
-            futures = {executor.submit(fetch_ticker_trades, ticker): ticker for ticker in tickers_to_process}
+            for chunk_start in range(0, len(tickers_to_process), SUBMIT_CHUNK_SIZE):
+                chunk = tickers_to_process[chunk_start:chunk_start + SUBMIT_CHUNK_SIZE]
+                futures = {executor.submit(fetch_ticker_trades, ticker): ticker for ticker in chunk}
 
-            for future in as_completed(futures):
-                ticker = futures[future]
-                try:
-                    trades_data = future.result()
-                    if trades_data:
-                        all_trades.extend(trades_data)
+                for future in as_completed(futures):
+                    ticker = futures[future]
+                    try:
+                        trades_data = future.result()
+                        if trades_data:
+                            all_trades.extend(trades_data)
 
-                    pbar.update(1)
-                    pbar.set_postfix(buffer=len(all_trades), saved=total_trades_saved, last=ticker[-20:])
+                        pbar.update(1)
+                        pbar.set_postfix(buffer=len(all_trades), saved=total_trades_saved, last=ticker[-20:])
 
-                    # Save in batches
-                    while len(all_trades) >= BATCH_SIZE:
-                        saved = save_batch(all_trades[:BATCH_SIZE])
-                        total_trades_saved += saved
-                        all_trades = all_trades[BATCH_SIZE:]
+                        # Save in batches
+                        while len(all_trades) >= BATCH_SIZE:
+                            saved = save_batch(all_trades[:BATCH_SIZE])
+                            total_trades_saved += saved
+                            all_trades = all_trades[BATCH_SIZE:]
 
-                except Exception as e:
-                    pbar.update(1)
-                    tqdm.write(f"Error fetching {ticker}: {e}")
+                    except Exception as e:
+                        pbar.update(1)
+                        tqdm.write(f"Error fetching {ticker}: {e}")
 
         pbar.close()
 

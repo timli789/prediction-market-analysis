@@ -92,6 +92,7 @@ class KalshiClient:
         cursor: Optional[str] = None,
         min_close_ts: Optional[int] = None,
         max_close_ts: Optional[int] = None,
+        status: Optional[str] = None,
     ) -> Generator[tuple[list[Market], Optional[str]], None, None]:
         while True:
             params = {"limit": limit}
@@ -101,6 +102,8 @@ class KalshiClient:
                 params["min_close_ts"] = min_close_ts
             if max_close_ts is not None:
                 params["max_close_ts"] = max_close_ts
+            if status is not None:
+                params["status"] = status
 
             data = self.http.get("/markets", params=params)
 

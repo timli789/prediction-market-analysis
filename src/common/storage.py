@@ -13,7 +13,21 @@ class ParquetStorage:
     def __init__(self, data_dir: Union[Path, str] = "data"):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self._existing_tickers: set[str] | None = None
+        self._buffer: list[dict] = []
+        self._next_start: int | None = None
+        self._existing_loaded = False
+        self._existing_count = 0
+
+        # Kalshi alone now has 70M+ market tickers on disk. Dedup used to load
+        # every ticker into a Python `set` -- tens of millions of Python str
+        # objects is itself several GB of interpreter overhead, which is what
+        # was actually OOM-killing this on memory-constrained devices (e.g.
+        # Raspberry Pi), not just slow. Keeping the dedup table inside DuckDB
+        # instead lets it spill to disk under these limits rather than
+        # exhausting RAM.
+        duckdb.sql("PRAGMA max_memory='2GB'")
+        duckdb.sql("PRAGMA threads=2")
+        duckdb.sql(f"PRAGMA temp_directory='{self.data_dir.parent / '.duckdb_tmp'}'")
 
     def _get_market_chunks(self) -> list[Path]:
         """Get all market chunk files sorted by start index."""
@@ -24,54 +38,77 @@ class ParquetStorage:
     def _chunk_path(self, start: int, end: int) -> Path:
         return self.data_dir / f"markets_{start}_{end}.parquet"
 
-    def _load_existing_tickers(self) -> set[str]:
-        """Load all existing tickers for deduplication."""
-        if self._existing_tickers is not None:
-            return self._existing_tickers
-        self._existing_tickers = set()
+    def _ensure_existing_tickers_loaded(self) -> None:
+        """Materialize existing tickers into a DuckDB temp table (once).
+
+        This replaces a `SELECT DISTINCT ... -> Python set` that doesn't scale
+        past tens of millions of rows. The temp table lives in DuckDB, bound
+        by the memory/temp_directory pragmas set in __init__.
+        """
+        if self._existing_loaded:
+            return
         chunks = self._get_market_chunks()
         if chunks:
-            result = duckdb.sql(f"SELECT DISTINCT ticker FROM '{self.data_dir}/markets_*.parquet'").fetchall()
-            self._existing_tickers = {row[0] for row in result}
-        return self._existing_tickers
+            duckdb.sql(f"""
+                CREATE OR REPLACE TEMP TABLE existing_tickers AS
+                SELECT DISTINCT ticker FROM '{self.data_dir}/markets_*.parquet'
+            """)
+        else:
+            duckdb.sql("CREATE OR REPLACE TEMP TABLE existing_tickers (ticker VARCHAR)")
+        self._existing_count = duckdb.sql("SELECT COUNT(*) FROM existing_tickers").fetchone()[0]
+        self._existing_loaded = True
+
+    def _next_chunk_start(self) -> int:
+        """Where the next new chunk file should start numbering from."""
+        if self._next_start is None:
+            chunks = self._get_market_chunks()
+            self._next_start = max((int(p.stem.split("_")[2]) for p in chunks), default=0)
+        return self._next_start
+
+    def _write_chunk(self, df: pd.DataFrame) -> None:
+        start = self._next_chunk_start()
+        end = start + len(df)
+        df.to_parquet(self._chunk_path(start, end))
+        self._next_start = end
+
+    def _dedup_and_flush(self, records: list[dict]) -> int:
+        """Drop records whose ticker is already known, write the rest, return count added."""
+        self._ensure_existing_tickers_loaded()
+        candidate = pd.DataFrame(records).drop_duplicates(subset="ticker")  # noqa: F841 (referenced by name in SQL below)
+        deduped = duckdb.sql("""
+            SELECT c.* FROM candidate c
+            ANTI JOIN existing_tickers e ON c.ticker = e.ticker
+        """).df()
+        if deduped.empty:
+            return 0
+        self._write_chunk(deduped)
+        duckdb.sql("INSERT INTO existing_tickers SELECT ticker FROM deduped")
+        return len(deduped)
 
     def append_markets(self, markets: list) -> int:
+        """Buffer and persist new markets, deduplicated by ticker.
+
+        New records are only ever written to brand-new chunk files, never
+        merged into an existing one -- the previous implementation read the
+        entire current chunk back into memory and rewrote it on every call,
+        which turned into a severe memory/IO blowup once a chunk grew into
+        the hundreds of thousands of rows. Call `flush()` once done fetching
+        to persist any leftover partial batch.
+        """
         fetched_at = datetime.utcnow()
-        existing = self._load_existing_tickers()
-
-        # Filter out duplicates
-        records = []
         for market in markets:
-            if market.ticker not in existing:
-                record = asdict(market)
-                record["_fetched_at"] = fetched_at
-                records.append(record)
-                existing.add(market.ticker)
+            record = asdict(market)
+            record["_fetched_at"] = fetched_at
+            self._buffer.append(record)
 
-        if not records:
-            return len(existing)
+        while len(self._buffer) >= self.CHUNK_SIZE:
+            self._existing_count += self._dedup_and_flush(self._buffer[: self.CHUNK_SIZE])
+            self._buffer = self._buffer[self.CHUNK_SIZE :]
 
-        new_df = pd.DataFrame(records)
-        chunks = self._get_market_chunks()
+        return self._existing_count
 
-        if not chunks:
-            chunk_path = self._chunk_path(0, self.CHUNK_SIZE)
-            new_df.to_parquet(chunk_path)
-            return len(existing)
-
-        last_chunk = chunks[-1]
-        last_df = pd.read_parquet(last_chunk)
-        combined = pd.concat([last_df, new_df], ignore_index=True)
-
-        start = int(last_chunk.stem.split("_")[1])
-        if len(combined) <= self.CHUNK_SIZE:
-            combined.to_parquet(last_chunk)
-        else:
-            first_part = combined.iloc[: self.CHUNK_SIZE]
-            first_part.to_parquet(last_chunk)
-            remaining = combined.iloc[self.CHUNK_SIZE :]
-            new_start = start + self.CHUNK_SIZE
-            new_chunk_path = self._chunk_path(new_start, new_start + self.CHUNK_SIZE)
-            remaining.to_parquet(new_chunk_path)
-
-        return len(existing)
+    def flush(self) -> None:
+        """Persist any buffered records smaller than a full chunk."""
+        if self._buffer:
+            self._existing_count += self._dedup_and_flush(self._buffer)
+            self._buffer = []
