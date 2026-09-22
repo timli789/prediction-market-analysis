@@ -25,7 +25,7 @@ class KalshiTradesIndexer(Indexer):
         self,
         min_ts: Optional[int] = None,
         max_ts: Optional[int] = None,
-        max_workers: int = 10,
+        max_workers: int = 4,
     ):
         super().__init__(
             name="kalshi_trades",
