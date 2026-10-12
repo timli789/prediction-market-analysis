@@ -25,16 +25,23 @@ class KalshiClient:
         data = self.http.get(f"/markets/{ticker}")
         return Market.from_dict(data["market"])
 
-    def get_market_trades(
+    def iter_market_trades(
         self,
         ticker: str,
         limit: int = 1000,
-        verbose: bool = True,
+        verbose: bool = False,
         min_ts: Optional[int] = None,
         max_ts: Optional[int] = None,
-    ) -> list[Trade]:
-        all_trades = []
+    ) -> Generator[list[Trade], None, None]:
+        """Yield a ticker's trades one API page at a time.
+
+        Unlike get_market_trades, this never holds more than one page in memory,
+        which matters because some tickers have 1M+ trades (e.g. high-volume
+        World Cup markets) — materializing one of those as a single list is
+        itself enough to contribute to an OOM on memory-constrained devices.
+        """
         cursor = None
+        total = 0
 
         while True:
             params = {"ticker": ticker, "limit": limit}
@@ -49,14 +56,28 @@ class KalshiClient:
 
             trades = [Trade.from_dict(t) for t in data.get("trades", [])]
             if trades:
-                all_trades.extend(trades)
+                total += len(trades)
                 if verbose:
-                    print(f"Fetched {len(trades)} trades (total: {len(all_trades)})")
+                    print(f"Fetched {len(trades)} trades (total: {total})")
+                yield trades
 
             cursor = data.get("cursor")
             if not cursor:
                 break
 
+    def get_market_trades(
+        self,
+        ticker: str,
+        limit: int = 1000,
+        verbose: bool = True,
+        min_ts: Optional[int] = None,
+        max_ts: Optional[int] = None,
+    ) -> list[Trade]:
+        all_trades: list[Trade] = []
+        for page in self.iter_market_trades(
+            ticker, limit=limit, verbose=verbose, min_ts=min_ts, max_ts=max_ts
+        ):
+            all_trades.extend(page)
         return all_trades
 
     def list_markets(self, limit: int = 20, **kwargs) -> list[Market]:
